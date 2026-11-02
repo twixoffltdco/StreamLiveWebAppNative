@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="ru"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<title>Игры — StreamLive</title>
+<link rel="stylesheet" href="/assets/webapp/app.css?v=132">
+<style>
+html,body{height:auto;min-height:100%;overflow:auto;margin:0;background:#0B0718;color:#fff}
+.gbar{position:sticky;top:0;z-index:5;display:flex;align-items:center;height:52px;padding:0 8px;background:#0B0718;border-bottom:1px solid rgba(255,255,255,.08)}
+.gbar a{color:#fff;text-decoration:none;font-size:28px;width:44px;text-align:center}
+.gbar h1{flex:1;margin:0;font-size:17px}
+#view{max-width:480px;margin:0 auto;padding:12px 14px 40px}
+</style>
+</head><body>
+<div class="gbar"><a href="/webapp/" id="backBtn">‹</a><h1 id="ttl">Игры офлайн</h1><span id="back" style="width:44px"></span></div>
+<main id="view"></main>
+<script src="/assets/webapp/games.js?v=132"></script>
+<script>
+document.getElementById('backBtn').onclick=function(e){
+  if(location.hash){e.preventDefault();location.hash='';}
+};
+</script>
+</body></html>

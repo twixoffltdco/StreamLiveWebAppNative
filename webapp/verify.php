@@ -1,0 +1,1 @@
+<?php header("Content-Type:text/html;charset=utf-8"); $js=@file_get_contents(dirname(__DIR__)."/assets/webapp/app.js"); echo (strpos($js,"1.4.4-F16")!==false)?"F16 OK <a href=/webapp/?v=1458>open</a>":"FAIL";
