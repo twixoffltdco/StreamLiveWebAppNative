@@ -17,8 +17,8 @@
     settings: (function(){
       try { return JSON.parse(localStorage.getItem('sl_settings') || '{}'); } catch(e){ return {}; }
     })(),
-    version: '1.4.4-F16',
-    build: 1458,
+    version: '1.4.4-F21',
+    build: 1463,
     devTap: 0,
 
     tab: 0,
@@ -1036,6 +1036,64 @@
     return state.base + (u.startsWith('/') ? u : '/' + u);
   }
 
+
+  /** POST/GET with form+JSON fallbacks, multiple paths — против anti-bot HTML. */
+  async function softFetchJson(paths, method, data) {
+    var origin = state.base || location.origin;
+    method = (method || 'GET').toUpperCase();
+    data = data || {};
+    function formBody(obj) {
+      var sp = new URLSearchParams();
+      Object.keys(obj).forEach(function(k) {
+        if (obj[k] != null && obj[k] !== '') sp.append(k, String(obj[k]));
+      });
+      return sp.toString();
+    }
+    function parseMaybeJson(text) {
+      text = (text || '').replace(/^\uFEFF/, '').trim();
+      try { return JSON.parse(text); } catch (e) {}
+      var m = text.match(/\{[\s\S]*"ok"[\s\S]*\}/);
+      if (m) { try { return JSON.parse(m[0]); } catch (e2) {} }
+      return null;
+    }
+    var lastErr = null;
+    for (var i = 0; i < paths.length; i++) {
+      var base = origin + paths[i];
+      var attempts = [];
+      if (method === 'GET') {
+        var q = formBody(data);
+        attempts.push({ url: base + (base.indexOf('?') >= 0 ? '&' : '?') + q, body: null, ct: null, method: 'GET' });
+      } else {
+        attempts.push({ url: base, body: formBody(data), ct: 'application/x-www-form-urlencoded;charset=UTF-8', method: 'POST' });
+        attempts.push({ url: base, body: JSON.stringify(data), ct: 'application/json', method: 'POST' });
+        attempts.push({ url: base, body: formBody(data), ct: null, method: 'POST' });
+      }
+      for (var a = 0; a < attempts.length; a++) {
+        try {
+          var at = attempts[a];
+          var headers = { 'Accept': 'application/json, text/plain, */*', 'X-SL-App': '1' };
+          if (at.ct) headers['Content-Type'] = at.ct;
+          if (state.apiKey) headers['X-API-KEY'] = state.apiKey;
+          var res = await fetch(at.url, {
+            method: at.method,
+            credentials: 'include',
+            headers: headers,
+            cache: 'no-store',
+            body: at.method === 'GET' ? undefined : at.body,
+            mode: 'same-origin'
+          });
+          var text = await res.text();
+          var dataJ = parseMaybeJson(text);
+          if (dataJ) return dataJ;
+          lastErr = 'not-json HTTP ' + res.status;
+        } catch (e) {
+          lastErr = e.message || String(e);
+        }
+      }
+    }
+    throw new Error(lastErr || 'Нет JSON от сервера');
+  }
+
   async function api(method, path, { query, body, failover = false } = {}) {
     if (path.indexOf('/api/') === 0) path = '/webapp' + path;
     const hosts = failover
@@ -1087,46 +1145,105 @@
     throw new Error(lastErr || 'Нет связи с сервером');
   }
 
-  async function auth(action, payload) {
-    var body = Object.assign({ action: action }, payload || {});
-    // Сначала webapp-копия API (чаще без anti-bot), потом корень
-    var paths = ['/webapp/api/native_auth.php', '/api/native_auth.php'];
-    var lastErr = null;
-    for (var i = 0; i < paths.length; i++) {
-      try {
-        // path already absolute under origin; api() prefixes /api/ -> /webapp/api/
-        var path = paths[i];
-        // call fetch directly to avoid double /webapp/webapp
-        var url = (state.base || location.origin) + path;
-        var opts = {
-          method: 'POST',
-          credentials: 'include',
-          headers: {
-            'Accept': 'application/json',
-            'Content-Type': 'application/json',
-            'X-SL-App': '1'
-          },
-          cache: 'no-store',
-          body: JSON.stringify(body)
-        };
-        if (state.apiKey) opts.headers['X-API-KEY'] = state.apiKey;
-        var res = await fetch(url, opts);
-        var text = await res.text();
-        var data;
-        try { data = JSON.parse(text); } catch (e) {
-          lastErr = (res.status === 503 || /проверка|ddos|proof-of-work/i.test(text))
-            ? 'API закрыто защитой хостинга (не JSON). Нужен whitelist /webapp/api/'
-            : ('Ответ не JSON (HTTP ' + res.status + ')');
-          continue;
-        }
-        return data;
-      } catch (e) {
-        lastErr = e.message || String(e);
+  function authViaIframe(action, payload) {
+    return new Promise(function(resolve, reject) {
+      var done = false;
+      var iframe = document.createElement('iframe');
+      iframe.name = 'sl_auth_iframe_' + Date.now();
+      iframe.style.cssText = 'position:absolute;width:1px;height:1px;left:-9999px;opacity:0;border:0';
+      var form = document.createElement('form');
+      form.method = 'POST';
+      form.action = (state.base || location.origin) + '/webapp/auth_bridge.php';
+      form.target = iframe.name;
+      form.acceptCharset = 'UTF-8';
+      form.style.display = 'none';
+      var data = Object.assign({ action: action }, payload || {});
+      Object.keys(data).forEach(function(k) {
+        if (data[k] == null || data[k] === '') return;
+        var inp = document.createElement('input');
+        inp.type = 'hidden';
+        inp.name = k;
+        inp.value = String(data[k]);
+        form.appendChild(inp);
+      });
+      function cleanup() {
+        try { window.removeEventListener('message', onMsg); } catch (e) {}
+        try { iframe.remove(); form.remove(); } catch (e) {}
       }
-    }
-    throw new Error(lastErr || 'Нет связи с auth API');
+      function finish(ok, val) {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        cleanup();
+        if (ok) resolve(val);
+        else reject(val instanceof Error ? val : new Error(String(val)));
+      }
+      function onMsg(ev) {
+        try {
+          var d = ev.data;
+          if (!d || d.type !== 'sl_auth') return;
+          finish(true, d.data);
+        } catch (e) {}
+      }
+      window.addEventListener('message', onMsg);
+      var timer = setTimeout(function() {
+        // try read iframe content if same-origin
+        try {
+          var doc = iframe.contentDocument || (iframe.contentWindow && iframe.contentWindow.document);
+          if (doc && doc.body) {
+            var pre = doc.body.innerText || doc.body.textContent || '';
+            var m = pre.match(/\{[\s\S]*\}/);
+            if (m) {
+              try { finish(true, JSON.parse(m[0])); return; } catch (e) {}
+            }
+          }
+        } catch (e) {}
+        finish(false, new Error('Таймаут входа (защита хостинга). Открой /webapp/auth_bridge.php в браузере — если HTML-проверка, нужен whitelist /webapp/'));
+      }, 12000);
+      document.body.appendChild(iframe);
+      document.body.appendChild(form);
+      form.submit();
+    });
   }
 
+  async function auth(action, payload) {
+    var bodyObj = Object.assign({ action: action }, payload || {});
+    var origin = state.base || location.origin;
+
+    // 1) iframe form POST — главный обход anti-bot
+    try {
+      var viaFrame = await authViaIframe(action, payload || {});
+      if (viaFrame && typeof viaFrame === 'object') return viaFrame;
+    } catch (eFrame) {
+      // fall through
+    }
+
+    // 2) softFetch form/json on multiple paths
+    try {
+      return await softFetchJson(
+        ['/webapp/auth_bridge.php', '/webapp/sl_auth.php', '/webapp/api/native_auth.php', '/api/native_auth.php'],
+        'POST',
+        bodyObj
+      );
+    } catch (eSoft) {}
+
+    // 3) last resort: relative path fetch form
+    try {
+      var res = await fetch('/webapp/auth_bridge.php', {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8', 'Accept': 'application/json' },
+        body: new URLSearchParams(bodyObj).toString()
+      });
+      var text = await res.text();
+      try { return JSON.parse(text); } catch (e) {
+        var m = text.match(/\{[\s\S]*"ok"[\s\S]*\}/);
+        if (m) return JSON.parse(m[0]);
+      }
+    } catch (e3) {}
+
+    throw new Error('Защита хостинга блокирует вход. Залей webapp/auth_bridge.php и в anti-bot исключи /webapp/ (или отключи проверку для POST форм).');
+  }
 
   function getSetting(k, def) {
     var s = state.settings || {};
@@ -2198,6 +2315,11 @@
       const subGame = el('button', { type: 'button', class: 'row' });
       subGame.innerHTML = '<div class="tx"><b>Добавить платную игру</b><small>ссылка на игру, не на сайт</small></div>';
       subGame.onclick = async function() {
+        if (!state.user || !state.user.id) {
+          toast('Сначала войди: Профиль → Войти');
+          go('auth');
+          return;
+        }
         const title = prompt('Название игры');
         if (!title) return;
         const url = prompt('Ссылка на ИГРУ (itch.io / play / html5…), не главная сайта');
@@ -2209,14 +2331,64 @@
         var pathOnly = false;
         try { var uo = new URL(url); pathOnly = (uo.pathname === '/' || uo.pathname === ''); } catch(e) {}
         if (pathOnly && !looks) { toast('Это похоже на сайт, а не на игру'); return; }
-        if (!looks && !pathOnly) { /* deep link ok */ }
+        var payload = {
+          action: 'submit',
+          title: title,
+          url: url,
+          price_sparks: price,
+          user_id: state.user.id,
+          username: state.user.username || '',
+          api_key: state.apiKey || ''
+        };
         try {
-          const r = await api('POST', '/api/native_games.php', {
-            body: { action: 'submit', title: title, url: url, price_sparks: price },
-            failover: false
-          });
-          if (r && r.ok) toast('Игра добавлена');
-          else toast((r && r.error) || 'Ошибка');
+          var r = null;
+          try {
+            r = await softFetchJson(
+              ['/webapp/sl_games.php', '/webapp/api/native_games.php', '/api/native_games.php'],
+              'POST', payload
+            );
+          } catch (e1) {
+            // iframe form fallback
+            r = await authViaIframe('submit', payload).catch(function(){ return null; });
+          }
+          // if authViaIframe wrong endpoint — direct form to games
+          if (!r || r.ok === false) {
+            r = await new Promise(function(resolve, reject) {
+              var iframe = document.createElement('iframe');
+              iframe.name = 'sl_game_' + Date.now();
+              iframe.style.cssText = 'position:absolute;width:1px;height:1px;left:-9999px;opacity:0';
+              var form = document.createElement('form');
+              form.method = 'POST';
+              form.action = (state.base || location.origin) + '/webapp/sl_games.php';
+              form.target = iframe.name;
+              form.style.display = 'none';
+              Object.keys(payload).forEach(function(k) {
+                var inp = document.createElement('input');
+                inp.type = 'hidden'; inp.name = k; inp.value = String(payload[k]);
+                form.appendChild(inp);
+              });
+              document.body.appendChild(iframe);
+              document.body.appendChild(form);
+              var t = setTimeout(function() {
+                try {
+                  var tx = (iframe.contentDocument && iframe.contentDocument.body && iframe.contentDocument.body.innerText) || '';
+                  var m = tx.match(/\{[\s\S]*\}/);
+                  if (m) resolve(JSON.parse(m[0]));
+                  else reject(new Error('Нет ответа'));
+                } catch (e) { reject(e); }
+                try { iframe.remove(); form.remove(); } catch (e2) {}
+              }, 5000);
+              form.submit();
+            }).catch(function(e){ return { ok: false, error: e.message }; });
+          }
+          if (r && r.ok) {
+            toast('Игра добавлена');
+            go('home');
+            state.tab = 4;
+            setTimeout(function(){ go('home'); }, 50);
+          } else {
+            toast((r && r.error) || 'Не удалось добавить игру');
+          }
         } catch (e) { toast(e.message || 'Ошибка'); }
       };
       c.appendChild(subGame);
@@ -2391,13 +2563,37 @@
         box.appendChild(chat);
 
         let after = 0;
+        let chatBooted = false;
+        const channelId = ch.id || ch.channel_id || 0;
         async function poll() {
+          if (!channelId) {
+            msgs.innerHTML = '<div class="m" style="color:var(--muted)">Нет id канала — чат недоступен</div>';
+            return;
+          }
           try {
-            const pr = await api('GET', '/api/native_comments.php', {
-              query: { channel_id: String(ch.id), after: String(after) }
-            });
-            const list = (pr && (pr.comments || pr.messages || pr.data)) || [];
+            const pr = await softFetchJson(
+              ['/webapp/sl_comments.php', '/webapp/api/native_comments.php', '/api/native_comments.php'],
+              'GET',
+              { channel_id: String(channelId), after: String(after) }
+            );
+            if (!pr || pr.ok === false) {
+              if (!chatBooted) {
+                msgs.innerHTML = '<div class="m" style="color:#f88">' + ((pr && pr.error) || 'Чат временно недоступен') + '</div>';
+              }
+              return;
+            }
+            const list = (pr.comments || pr.messages || pr.data || []);
+            if (!chatBooted) {
+              msgs.innerHTML = '';
+              chatBooted = true;
+              if (!list.length) {
+                msgs.innerHTML = '<div class="m" style="color:var(--muted)">Пока нет сообщений — напиши первым</div>';
+              }
+            }
             if (list.length) {
+              // remove empty placeholder
+              const ph = msgs.querySelector('.m[style]');
+              if (ph && /Пока нет|Чат канала|недоступен/.test(ph.textContent || '')) ph.remove();
               list.forEach(m => {
                 const id = m.id || 0;
                 if (id > after) after = id;
@@ -2405,18 +2601,39 @@
                 const role = (m.role || '').toLowerCase();
                 const isMod = m.is_mod || role === 'moderator' || role === 'admin';
                 const badge = isMod ? ' <span class="mod-badge">MOD</span>' : (m.is_verified ? ' ✓' : '');
-                line.innerHTML = '<b></b><span></span>';
-                line.querySelector('b').innerHTML = (m.username || m.user || 'anon') + badge;
-                line.querySelector('span').textContent = m.message || m.text || m.body || '';
+                const name = m.username || m.user || 'anon';
+                const text = m.message || m.text || m.body || '';
+                line.innerHTML = '<b></b> <span></span>';
+                line.querySelector('b').textContent = name;
+                if (badge) {
+                  const b = document.createElement('span');
+                  b.innerHTML = badge;
+                  line.querySelector('b').appendChild(b.firstChild);
+                }
+                line.querySelector('span').textContent = text;
                 msgs.appendChild(line);
               });
               msgs.scrollTop = msgs.scrollHeight;
             }
-          } catch (_) {}
+          } catch (e) {
+            if (!chatBooted) {
+              msgs.innerHTML = '<div class="m" style="color:#f88">' + (e.message || 'Ошибка чата') + '</div>';
+            }
+          }
         }
         poll();
+        // пока на канале — чаще (1–2 мин), настройка «экономия» не ниже 1 мин
         var chMin = parseInt(getSetting('chat_poll_min', 30), 10) || 30;
-        const timer = setInterval(function(){ if (!document.hidden) poll(); }, Math.max(5, chMin) * 60 * 1000);
+        var pollMs = Math.min(Math.max(1, chMin), 30) * 60 * 1000;
+        // first minutes: every 45s so chat feels alive without hammering
+        var timer = setInterval(function(){ if (!document.hidden) poll(); }, 45000);
+        // after 3 min switch to user setting
+        setTimeout(function(){
+          clearInterval(timer);
+          timer = setInterval(function(){ if (!document.hidden) poll(); }, pollMs);
+          root._chatTimer = timer;
+        }, 180000);
+        root._chatTimer = timer;
         // clear on next render roughly
         root._chatTimer = timer;
         // Лёгкая проверка смены потока раз в 3 мин (1 запрос) — без reload страницы
@@ -2448,11 +2665,22 @@
           const text = (inp.value || '').trim();
           if (!text) return;
           try {
-            await api('POST', '/api/native_comments.php', {
-              body: { channel_id: ch.id, message: text },
-              failover: false
-            });
+            if (!channelId) { toast('Нет id канала'); return; }
+            const sr = await softFetchJson(
+              ['/webapp/sl_comments.php', '/webapp/api/native_comments.php', '/api/native_comments.php'],
+              'POST',
+              { channel_id: channelId, message: text }
+            );
+            if (sr && sr.ok === false) throw new Error(sr.error || 'Не отправилось');
             inp.value = '';
+            // optimistic line
+            const line = el('div', { class: 'm' });
+            line.innerHTML = '<b></b> <span></span>';
+            line.querySelector('b').textContent = (state.user && state.user.username) || 'я';
+            line.querySelector('span').textContent = text;
+            if (chatBooted && msgs.querySelector('.m[style]')) msgs.innerHTML = '';
+            msgs.appendChild(line);
+            msgs.scrollTop = msgs.scrollHeight;
             poll();
           } catch (e) {
             toast(e.message || 'Не отправилось');
@@ -3453,7 +3681,7 @@
   async function registerAppWorker() {
     if (!('serviceWorker' in navigator)) return;
     try {
-      const reg = await navigator.serviceWorker.register('/webapp/sw.js?v=1458', { scope: '/webapp/' });
+      const reg = await navigator.serviceWorker.register('/webapp/sw.js?v=1463', { scope: '/webapp/' });
       reg.addEventListener('updatefound', () => {
         const worker = reg.installing;
         if (!worker) return;
