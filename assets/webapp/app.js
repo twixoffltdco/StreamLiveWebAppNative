@@ -17,8 +17,8 @@
     settings: (function(){
       try { return JSON.parse(localStorage.getItem('sl_settings') || '{}'); } catch(e){ return {}; }
     })(),
-    version: '1.4.4-F21',
-    build: 1463,
+    version: '1.4.4-F22',
+    build: 1464,
     devTap: 0,
 
     tab: 0,
@@ -2574,7 +2574,13 @@
             const pr = await softFetchJson(
               ['/webapp/sl_comments.php', '/webapp/api/native_comments.php', '/api/native_comments.php'],
               'GET',
-              { channel_id: String(channelId), after: String(after) }
+              {
+                channel_id: String(channelId),
+                after: String(after),
+                user_id: state.user && state.user.id,
+                username: state.user && state.user.username,
+                api_key: state.apiKey || ''
+              }
             );
             if (!pr || pr.ok === false) {
               if (!chatBooted) {
@@ -2594,23 +2600,65 @@
               // remove empty placeholder
               const ph = msgs.querySelector('.m[style]');
               if (ph && /Пока нет|Чат канала|недоступен/.test(ph.textContent || '')) ph.remove();
+              if (pr.me_banned) {
+                msgs.innerHTML = '<div class="m" style="color:var(--muted)">Вас заблокировали в этом канале. Сообщения недоступны.</div>';
+                if (inpRow) inpRow.style.display = 'none';
+                return;
+              }
+              window.__slCanMod = !!pr.can_moderate;
               list.forEach(m => {
                 const id = m.id || 0;
                 if (id > after) after = id;
                 const line = el('div', { class: 'm' });
                 const role = (m.role || '').toLowerCase();
                 const isMod = m.is_mod || role === 'moderator' || role === 'admin';
-                const badge = isMod ? ' <span class="mod-badge">MOD</span>' : (m.is_verified ? ' ✓' : '');
                 const name = m.username || m.user || 'anon';
                 const text = m.message || m.text || m.body || '';
+                const uid = m.userId || m.user_id || 0;
                 line.innerHTML = '<b></b> <span></span>';
-                line.querySelector('b').textContent = name;
-                if (badge) {
-                  const b = document.createElement('span');
-                  b.innerHTML = badge;
-                  line.querySelector('b').appendChild(b.firstChild);
+                const bEl = line.querySelector('b');
+                bEl.textContent = name;
+                if (isMod) {
+                  const badge = document.createElement('span');
+                  badge.className = 'mod-badge';
+                  badge.textContent = 'MOD';
+                  bEl.appendChild(document.createTextNode(' '));
+                  bEl.appendChild(badge);
+                } else if (m.is_verified) {
+                  bEl.appendChild(document.createTextNode(' ✓'));
                 }
                 line.querySelector('span').textContent = text;
+                if (window.__slCanMod && uid && !(state.user && String(state.user.id) === String(uid))) {
+                  const banBtn = el('button', { type: 'button', class: 'mod-btn', title: 'Заблокировать' }, '🚫');
+                  banBtn.onclick = async function(ev) {
+                    ev.preventDefault();
+                    ev.stopPropagation();
+                    if (!confirm('Заблокировать «' + name + '» в этом канале? Его сообщения сгорят.')) return;
+                    try {
+                      const br = await softFetchJson(
+                        ['/webapp/sl_comments.php', '/webapp/api/native_comments.php', '/api/native_comments.php'],
+                        'POST',
+                        {
+                          action: 'ban',
+                          channel_id: channelId,
+                          user_id: uid,
+                          comment_id: id,
+                          user_id_mod: state.user && state.user.id,
+                          username: state.user && state.user.username,
+                          api_key: state.apiKey || ''
+                        }
+                      );
+                      if (br && br.ok === false) throw new Error(br.error || 'Ошибка');
+                      // убрать все сообщения этого юзера из UI
+                      Array.from(msgs.querySelectorAll('.m')).forEach(function(node) {
+                        var bn = node.querySelector('b');
+                        if (bn && bn.childNodes[0] && bn.childNodes[0].textContent === name) node.remove();
+                      });
+                      toast('Заблокирован · сообщения удалены');
+                    } catch (e) { toast(e.message || 'Не удалось'); }
+                  };
+                  line.appendChild(banBtn);
+                }
                 msgs.appendChild(line);
               });
               msgs.scrollTop = msgs.scrollHeight;
@@ -2669,7 +2717,14 @@
             const sr = await softFetchJson(
               ['/webapp/sl_comments.php', '/webapp/api/native_comments.php', '/api/native_comments.php'],
               'POST',
-              { channel_id: channelId, message: text }
+              {
+                action: 'send',
+                channel_id: channelId,
+                message: text,
+                user_id: state.user && state.user.id,
+                username: state.user && state.user.username,
+                api_key: state.apiKey || ''
+              }
             );
             if (sr && sr.ok === false) throw new Error(sr.error || 'Не отправилось');
             inp.value = '';
@@ -3681,7 +3736,7 @@
   async function registerAppWorker() {
     if (!('serviceWorker' in navigator)) return;
     try {
-      const reg = await navigator.serviceWorker.register('/webapp/sw.js?v=1463', { scope: '/webapp/' });
+      const reg = await navigator.serviceWorker.register('/webapp/sw.js?v=1464', { scope: '/webapp/' });
       reg.addEventListener('updatefound', () => {
         const worker = reg.installing;
         if (!worker) return;
