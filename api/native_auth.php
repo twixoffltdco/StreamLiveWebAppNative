@@ -111,10 +111,32 @@ function na_check_ban(array &$user): ?string {
   return null;
 }
 
-if ($_SERVER['REQUEST_METHOD'] !== 'POST') na_out(['ok' => false, 'error' => 'POST only'], 405);
-$in = json_decode(file_get_contents('php://input') ?: '{}', true);
+// GET me для прогрева (обход части anti-bot) + POST login/register
+if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'GET') {
+  $action = (string)($_GET['action'] ?? 'ping');
+  if ($action === 'ping') {
+    na_out(['ok' => true, 'ping' => 1, 'path' => 'auth']);
+  }
+  if ($action === 'me') {
+    $u = function_exists('current_user') ? current_user() : null;
+    if (!$u) na_out(['ok' => false, 'error' => 'Не авторизован'], 401);
+    na_out(['ok' => true, 'user' => na_user_payload($u)]);
+  }
+  na_out(['ok' => false, 'error' => 'GET: action=ping|me'], 400);
+}
+if (($_SERVER['REQUEST_METHOD'] ?? '') !== 'POST') na_out(['ok' => false, 'error' => 'POST only'], 405);
+// JSON или application/x-www-form-urlencoded (WAF часто режет только JSON)
+$raw = file_get_contents('php://input') ?: '';
+$in = json_decode($raw, true);
 if (!is_array($in)) $in = [];
-$action = (string)($in['action'] ?? '');
+if (!$in) {
+  $in = $_POST ?: [];
+}
+if (!$in && $raw !== '') {
+  parse_str($raw, $parsed);
+  if (is_array($parsed)) $in = $parsed;
+}
+$action = (string)($in['action'] ?? $_GET['action'] ?? '');
 
 /* ---- me ---- */
 if ($action === 'me') {

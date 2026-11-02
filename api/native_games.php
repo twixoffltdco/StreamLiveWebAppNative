@@ -1,15 +1,15 @@
 <?php
 /**
- * Платные игры WebApp — без модерации, сразу approved.
- * Проверка: ссылка должна быть похожа на игру (не просто «сайт»).
- * Искры списываются на клиенте и сгорают.
- *
- * GET  ?action=list
- * POST {action:"submit", title, url, price_sparks, description?}
- * POST {action:"buy", id}
+ * Платные игры WebApp.
+ * Auth: session cookie ИЛИ X-API-KEY ИЛИ user_id+username (мягко, для WebApp).
  */
-require_once dirname(__DIR__) . '/includes/functions.php';
-require_once dirname(__DIR__) . '/includes/auth.php';
+$SL_ROOT = dirname(__DIR__);
+if (!is_file($SL_ROOT . '/includes/functions.php')) {
+  $SL_ROOT = dirname(dirname(__DIR__)); // webapp/api → site root
+}
+require_once $SL_ROOT . '/includes/functions.php';
+require_once $SL_ROOT . '/includes/auth.php';
+if (is_file($SL_ROOT . '/includes/api_auth.php')) require_once $SL_ROOT . '/includes/api_auth.php';
 
 header('Content-Type: application/json; charset=utf-8');
 header('Access-Control-Allow-Origin: *');
@@ -30,7 +30,7 @@ function ng_ensure_table(): void {
   try {
     db()->exec("CREATE TABLE IF NOT EXISTS paid_games (
       id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-      user_id INT UNSIGNED NOT NULL,
+      user_id INT UNSIGNED NOT NULL DEFAULT 0,
       title VARCHAR(150) NOT NULL,
       description VARCHAR(1000) DEFAULT '',
       url VARCHAR(500) NOT NULL,
@@ -42,7 +42,6 @@ function ng_ensure_table(): void {
   } catch (Throwable $e) {}
 }
 
-/** Ссылка должна выглядеть как игра, не просто главная сайта. */
 function ng_looks_like_game(string $url): array {
   $url = trim($url);
   if (!preg_match('#^https?://#i', $url)) {
@@ -53,47 +52,86 @@ function ng_looks_like_game(string $url): array {
   $host = strtolower($p['host']);
   $path = strtolower($p['path'] ?? '/');
   $full = strtolower($url);
-
-  // Известные игровые площадки / расширения
   $gameHosts = [
     'itch.io', 'newgrounds.com', 'crazygames.com', 'poki.com', 'gamejolt.com',
     'kongregate.com', 'armor.games', 'miniclip.com', 'y8.com', 'io-games.io',
-    'github.io', 'raw.githack.com', 'gamedistribution.com', 'gamedistribution.com',
+    'github.io', 'raw.githack.com', 'gamedistribution.com',
     'unityroom.com', 'simmer.io', 'playhop.com', 'gamepix.com', 'gameflare.com',
   ];
   foreach ($gameHosts as $h) {
-    if ($host === $h || str_ends_with($host, '.' . $h)) return [true, ''];
+    if ($host === $h || (function_exists('str_ends_with') && str_ends_with($host, '.' . $h)) || substr($host, -strlen($h)-1) === '.'.$h) {
+      return [true, ''];
+    }
   }
-
-  // path keywords
   $keys = ['game', 'play', 'arcade', 'unity', 'html5', 'wasm', 'phaser', 'construct', 'godot', 'embed', 'swf'];
   foreach ($keys as $k) {
     if (strpos($path, $k) !== false || strpos($full, $k) !== false) return [true, ''];
   }
-
-  // file-like game ends
   if (preg_match('#\.(html?|swf|unityweb|data|wasm)(\?|$)#i', $path)) return [true, ''];
-
-  // bare domain homepage — reject
   if ($path === '/' || $path === '' || $path === '/index.html' || $path === '/index.php') {
     return [false, 'Нужна ссылка на игру, а не на главную сайта'];
   }
-
-  // deep path with 2+ segments — allow cautiously
   $parts = array_values(array_filter(explode('/', $path)));
   if (count($parts) >= 2) return [true, ''];
+  return [false, 'Ссылка не похожа на игру'];
+}
 
-  return [false, 'Ссылка не похожа на игру. Укажи прямую ссылку на play/game/html5'];
+/** Resolve user: session → api key → posted user_id+username */
+function ng_resolve_user(array $input): ?array {
+  if (function_exists('current_user')) {
+    $u = current_user();
+    if ($u && !empty($u['id'])) return $u;
+  }
+  $key = $_SERVER['HTTP_X_API_KEY'] ?? ($input['api_key'] ?? '');
+  $key = trim((string)$key);
+  if ($key !== '' && function_exists('api_key_user')) {
+    try {
+      $u = api_key_user($key);
+      if ($u) return $u;
+    } catch (Throwable $e) {}
+  }
+  if ($key !== '') {
+    try {
+      // common patterns
+      if (function_exists('api_auth_user_by_key')) {
+        $u = api_auth_user_by_key($key);
+        if ($u) return $u;
+      }
+    } catch (Throwable $e) {}
+    try {
+      $st = db()->prepare('SELECT u.* FROM users u INNER JOIN api_keys k ON k.user_id = u.id WHERE k.api_key = ? LIMIT 1');
+      $st->execute([$key]);
+      $u = $st->fetch();
+      if ($u) return $u;
+    } catch (Throwable $e) {}
+  }
+  $uid = (int)($input['user_id'] ?? 0);
+  $uname = trim((string)($input['username'] ?? ''));
+  if ($uid > 0 && $uname !== '') {
+    try {
+      $st = db()->prepare('SELECT * FROM users WHERE id = ? AND username = ? LIMIT 1');
+      $st->execute([$uid, $uname]);
+      $u = $st->fetch();
+      if ($u) return $u;
+    } catch (Throwable $e) {}
+  }
+  return null;
 }
 
 ng_ensure_table();
 $method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
-$user = function_exists('current_user') ? current_user() : null;
-$input = [];
-if ($method === 'POST') {
-  $input = json_decode(file_get_contents('php://input') ?: '{}', true) ?: [];
+if ($method === 'OPTIONS') { http_response_code(204); exit; }
+
+$raw = file_get_contents('php://input') ?: '';
+$input = json_decode($raw, true);
+if (!is_array($input)) $input = [];
+if (!$input) $input = $_POST ?: [];
+if (!$input && $raw !== '') { parse_str($raw, $p); if (is_array($p)) $input = $p; }
+if ($method === 'GET') {
+  foreach ($_GET as $k => $v) { if (!isset($input[$k])) $input[$k] = $v; }
 }
-$action = strtolower(trim((string)($_GET['action'] ?? $input['action'] ?? 'list')));
+
+$action = strtolower(trim((string)($input['action'] ?? $_GET['action'] ?? 'list')));
 
 if ($action === 'list') {
   try {
@@ -109,7 +147,10 @@ if ($action === 'list') {
 }
 
 if ($method === 'POST' && $action === 'submit') {
-  if (!$user) ng_out(['ok' => false, 'error' => 'Нужно войти'], 401);
+  $user = ng_resolve_user($input);
+  if (!$user) {
+    ng_out(['ok' => false, 'error' => 'Войдите в аккаунт в приложении (Профиль → Войти), затем добавьте игру'], 401);
+  }
   $title = trim(mb_substr((string)($input['title'] ?? ''), 0, 150));
   $url = trim(mb_substr((string)($input['url'] ?? ''), 0, 500));
   $desc = trim(mb_substr((string)($input['description'] ?? ''), 0, 1000));
@@ -120,9 +161,9 @@ if ($method === 'POST' && $action === 'submit') {
   try {
     db()->prepare('INSERT INTO paid_games (user_id, title, description, url, price_sparks, status) VALUES (?,?,?,?,?,"approved")')
       ->execute([(int)$user['id'], $title, $desc, $url, $price]);
-    ng_out(['ok' => true, 'id' => (int)db()->lastInsertId(), 'status' => 'approved']);
+    ng_out(['ok' => true, 'id' => (int)db()->lastInsertId(), 'status' => 'approved', 'user_id' => (int)$user['id']]);
   } catch (Throwable $e) {
-    ng_out(['ok' => false, 'error' => 'db'], 500);
+    ng_out(['ok' => false, 'error' => 'db: ' . $e->getMessage()], 500);
   }
 }
 
